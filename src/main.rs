@@ -22,16 +22,27 @@ use std::path::PathBuf;
     about = "Vault Delegation Program Optimizer"
 )]
 struct Cli {
-    #[arg(short = 'c', long = "config", default_value_os_t = default_config_path())]
+    #[arg(
+        short = 'c',
+        long = "config",
+        default_value_os_t = default_config_path(),
+        global = true
+    )]
     config: PathBuf,
 
-    #[arg(short = 'r', long = "rpc")]
+    #[arg(short = 'r', long = "rpc", global = true)]
     rpc: Option<String>,
 
-    #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+    #[arg(
+        short = 'o',
+        long = "output",
+        value_enum,
+        default_value_t = OutputFormat::Table,
+        global = true
+    )]
     output: OutputFormat,
 
-    #[arg(short = 'v', long = "verbose")]
+    #[arg(short = 'v', long = "verbose", global = true)]
     verbose: bool,
 
     #[command(subcommand)]
@@ -181,6 +192,7 @@ fn main() -> Result<()> {
                 gauge_reserve_sol: sample.pool.gauge_reserve_sol,
                 total_vev: sample.gauge.total_vev_voting,
                 pool_apy: sample.pool.apy,
+                sol_price_usdc: 200.0,
                 votex_clearing_price: sample.votex.clearing_price_per_vev,
                 v_price_usdc: sample.vtoken.price_usdc,
                 lock_years: 3.0,
@@ -204,6 +216,7 @@ fn main() -> Result<()> {
                 gauge_reserve_sol: sample.pool.gauge_reserve_sol,
                 total_vev: sample.gauge.total_vev_voting,
                 pool_apy: sample.pool.apy,
+                sol_price_usdc: 200.0,
                 votex_clearing_price: sample.votex.clearing_price_per_vev,
                 v_price_usdc: v_price.unwrap_or(sample.vtoken.price_usdc),
                 lock_years: lock_years.unwrap_or(3.0),

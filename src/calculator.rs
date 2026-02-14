@@ -66,6 +66,7 @@ pub struct StrategyRequest {
     pub gauge_reserve_sol: f64,
     pub total_vev: f64,
     pub pool_apy: f64,
+    pub sol_price_usdc: f64,
     pub votex_clearing_price: f64,
     pub v_price_usdc: f64,
     pub lock_years: f64,
@@ -111,10 +112,11 @@ impl CostCalculator {
     pub fn roi(
         target_sol: f64,
         pool_apy: f64,
+        sol_price_usdc: f64,
         acquisition_cost: f64,
         strategy_is_recurring: bool,
     ) -> RoiEstimate {
-        let annual_reward = target_sol * pool_apy;
+        let annual_reward = target_sol * pool_apy * sol_price_usdc;
         let annual_cost = if strategy_is_recurring {
             acquisition_cost * 52.0
         } else {
@@ -145,10 +147,16 @@ pub fn compare_strategies(request: &StrategyRequest) -> Result<StrategyCompariso
         request.total_vev,
         request.target_sol,
     )?;
-    let annual_staking_reward = request.target_sol * request.pool_apy;
+    let annual_staking_reward = request.target_sol * request.pool_apy * request.sol_price_usdc;
 
     let buy_per_epoch = CostCalculator::votex_cost(vev_needed, request.votex_clearing_price);
-    let buy_roi = CostCalculator::roi(request.target_sol, request.pool_apy, buy_per_epoch, true);
+    let buy_roi = CostCalculator::roi(
+        request.target_sol,
+        request.pool_apy,
+        request.sol_price_usdc,
+        buy_per_epoch,
+        true,
+    );
     let buy = CostPerSolEstimate {
         target_sol: request.target_sol,
         current_gauge_reserve: request.gauge_reserve_sol,
@@ -166,7 +174,13 @@ pub fn compare_strategies(request: &StrategyRequest) -> Result<StrategyCompariso
     };
 
     let lock = CostCalculator::lock_cost(vev_needed, request.v_price_usdc, request.lock_years);
-    let lock_roi = CostCalculator::roi(request.target_sol, request.pool_apy, lock.cost_usdc, false);
+    let lock_roi = CostCalculator::roi(
+        request.target_sol,
+        request.pool_apy,
+        request.sol_price_usdc,
+        lock.cost_usdc,
+        false,
+    );
     let lock_estimate = CostPerSolEstimate {
         target_sol: request.target_sol,
         current_gauge_reserve: request.gauge_reserve_sol,
@@ -259,6 +273,7 @@ mod tests {
             gauge_reserve_sol: 124_266.0,
             total_vev: 8_432_100.0,
             pool_apy: 0.0584,
+            sol_price_usdc: 200.0,
             votex_clearing_price: 0.057,
             v_price_usdc: 0.5,
             lock_years: 3.0,
