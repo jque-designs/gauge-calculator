@@ -17,7 +17,7 @@ use crate::{
     config::AppConfig,
     runtime::build_runtime_context,
     snapshot::{resolve_path as resolve_snapshot_path, SnapshotStore},
-    types::GaugeEligibility,
+    types::{GaugeEligibility, ValidatorGaugeEntry},
 };
 
 #[derive(Clone)]
@@ -36,8 +36,8 @@ impl ApiState {
 }
 
 pub fn router(state: ApiState) -> Router {
-    Router::new()
-        .route("/", get(index))
+    let api = Router::new()
+        .route("/docs", get(api_docs))
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/calculate", get(calculate))
@@ -47,9 +47,17 @@ pub fn router(state: ApiState) -> Router {
         .route("/eligibility", get(eligibility))
         .route("/votex", get(votex))
         .route("/epoch", get(epoch))
+        .route("/threats", get(threats))
+        .route("/opportunities", get(opportunities))
+        .route("/queue", get(queue))
+        .route("/cohorts", get(cohorts))
         .route("/snapshot/save", post(snapshot_save))
         .route("/snapshot/load", get(snapshot_load))
-        .route("/snapshot/list", get(snapshot_list))
+        .route("/snapshot/list", get(snapshot_list));
+
+    Router::new()
+        .route("/", get(index))
+        .nest("/api", api)
         .with_state(state)
 }
 
@@ -145,6 +153,19 @@ struct SnapshotListQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ThreatsQuery {
+    validator: Option<String>,
+    live: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueQuery {
+    validator: Option<String>,
+    pool: Option<String>,
+    live: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum ApiStrategyFilter {
@@ -157,19 +178,31 @@ enum ApiStrategyFilter {
 async fn index() -> Json<Value> {
     Json(json!({
         "name": "gauge-api",
-        "endpoints": [
-            "GET /health",
-            "GET /status",
-            "GET /calculate",
-            "GET /compare",
-            "GET /concentration",
-            "GET /competitors",
-            "GET /eligibility",
-            "GET /votex",
-            "GET /epoch",
-            "POST /snapshot/save",
-            "GET /snapshot/load",
-            "GET /snapshot/list"
+        "docs": "/api/docs"
+    }))
+}
+
+async fn api_docs() -> Json<Value> {
+    Json(json!({
+        "name": "gauge-api",
+        "routes": [
+            {"method": "GET", "path": "/api/health", "description": "Basic health check"},
+            {"method": "GET", "path": "/api/docs", "description": "List available routes"},
+            {"method": "GET", "path": "/api/threats?validator=<pubkey>", "description": "Threat assessment for validator"},
+            {"method": "GET", "path": "/api/opportunities", "description": "Decay/displacement opportunities"},
+            {"method": "GET", "path": "/api/queue?validator=<pubkey>&pool=<pool>", "description": "Stake pool queue position"},
+            {"method": "GET", "path": "/api/cohorts", "description": "Cohort flow analysis"},
+            {"method": "GET", "path": "/api/status", "description": "Current gauge status"},
+            {"method": "GET", "path": "/api/calculate?target_sol=<sol>", "description": "Strategy calculator"},
+            {"method": "GET", "path": "/api/compare?target_sol=<sol>", "description": "Strategy comparison"},
+            {"method": "GET", "path": "/api/concentration", "description": "Concentration metrics"},
+            {"method": "GET", "path": "/api/competitors", "description": "Competitor classifier"},
+            {"method": "GET", "path": "/api/eligibility?validator=<pubkey>", "description": "Eligibility check"},
+            {"method": "GET", "path": "/api/votex", "description": "Votex market snapshot"},
+            {"method": "GET", "path": "/api/epoch", "description": "Epoch timing"},
+            {"method": "POST", "path": "/api/snapshot/save", "description": "Persist snapshot"},
+            {"method": "GET", "path": "/api/snapshot/load", "description": "Load persisted snapshot"},
+            {"method": "GET", "path": "/api/snapshot/list", "description": "List persisted snapshots"}
         ]
     }))
 }
@@ -334,6 +367,153 @@ async fn epoch(State(state): State<ApiState>, Query(query): Query<LiveQuery>) ->
     })))
 }
 
+async fn threats(
+    State(state): State<ApiState>,
+    Query(query): Query<ThreatsQuery>,
+) -> ApiResult<Value> {
+    let runtime = runtime_for(&state, query.live)?;
+    let target = query
+        .validator
+        .ok_or_else(|| ApiError::bad_request("validator query parameter is required"))?;
+    let validator = find_validator(&runtime.context.gauge.validators, &target)
+        .ok_or_else(|| ApiError::bad_request(format!("validator not found: {target}")))?;
+    let report = ConcentrationAnalyzer::analyze(
+        &runtime.context.gauge,
+        runtime.context.votex.clearing_price_per_vev,
+    );
+    let displacement = report
+        .displacement_cost
+        .iter()
+        .find(|entry| entry.validator == validator.vote_account)
+        .cloned();
+
+    let mut ranked = runtime.context.gauge.validators.clone();
+    ranked.sort_by(|a, b| b.projected_sol.total_cmp(&a.projected_sol));
+    let rank = ranked
+        .iter()
+        .position(|v| v.vote_account == validator.vote_account)
+        .map(|i| i + 1)
+        .unwrap_or(0);
+
+    let threat_level = displacement
+        .as_ref()
+        .map(|d| classify_threat_level(d.estimated_cost_usdc))
+        .unwrap_or("unknown");
+
+    let neighbors = ranking_neighbors(&ranked, rank.saturating_sub(1));
+
+    Ok(Json(json!({
+        "validator": validator,
+        "rank": rank,
+        "threat_level": threat_level,
+        "estimated_displacement": displacement,
+        "neighbors": neighbors,
+        "live": runtime.live_data
+    })))
+}
+
+async fn opportunities(
+    State(state): State<ApiState>,
+    Query(query): Query<LiveQuery>,
+) -> ApiResult<Value> {
+    let runtime = runtime_for(&state, query.live)?;
+    let report = ConcentrationAnalyzer::analyze(
+        &runtime.context.gauge,
+        runtime.context.votex.clearing_price_per_vev,
+    );
+
+    let mut cheapest = report.displacement_cost.clone();
+    cheapest.sort_by(|a, b| a.estimated_cost_usdc.total_cmp(&b.estimated_cost_usdc));
+    let cheapest = cheapest.into_iter().take(5).collect::<Vec<_>>();
+
+    let fragile = runtime
+        .context
+        .gauge
+        .validators
+        .iter()
+        .filter(|v| !v.eligibility_issues.is_empty() || !v.eligible)
+        .map(|v| {
+            json!({
+                "validator": v.vote_account,
+                "name": v.name,
+                "eligible": v.eligible,
+                "issues": v.eligibility_issues,
+                "projected_sol": v.projected_sol
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(json!({
+        "decay_opportunities": cheapest,
+        "fragile_validators": fragile,
+        "note": "Decay opportunities are approximated via displacement cost and eligibility fragility.",
+        "live": runtime.live_data
+    })))
+}
+
+async fn queue(State(state): State<ApiState>, Query(query): Query<QueueQuery>) -> ApiResult<Value> {
+    let runtime = runtime_for(&state, query.live)?;
+    let target = query
+        .validator
+        .ok_or_else(|| ApiError::bad_request("validator query parameter is required"))?;
+    let pool = query
+        .pool
+        .ok_or_else(|| ApiError::bad_request("pool query parameter is required"))?;
+
+    let mut ranked = runtime.context.gauge.validators.clone();
+    ranked.sort_by(|a, b| b.projected_sol.total_cmp(&a.projected_sol));
+    let validator = find_validator(&ranked, &target)
+        .ok_or_else(|| ApiError::bad_request(format!("validator not found: {target}")))?;
+    let position = ranked
+        .iter()
+        .position(|v| v.vote_account == validator.vote_account)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+
+    Ok(Json(json!({
+        "pool": pool,
+        "validator": {
+            "vote_account": validator.vote_account,
+            "name": validator.name
+        },
+        "queue_position": position,
+        "queue_size": ranked.len(),
+        "projected_sol": validator.projected_sol,
+        "share": validator.vote_share,
+        "live": runtime.live_data
+    })))
+}
+
+async fn cohorts(
+    State(state): State<ApiState>,
+    Query(query): Query<LiveQuery>,
+) -> ApiResult<Value> {
+    let runtime = runtime_for(&state, query.live)?;
+    let mut ranked = runtime.context.gauge.validators.clone();
+    ranked.sort_by(|a, b| b.vote_share.total_cmp(&a.vote_share));
+    let len = ranked.len();
+    let first_cut = len.div_ceil(3);
+    let second_cut = (len * 2).div_ceil(3);
+
+    let top = cohort_summary("top", &ranked[..first_cut], runtime.context.pool.gauge_reserve_sol);
+    let middle = cohort_summary(
+        "middle",
+        &ranked[first_cut..second_cut],
+        runtime.context.pool.gauge_reserve_sol,
+    );
+    let tail = cohort_summary(
+        "tail",
+        &ranked[second_cut..],
+        runtime.context.pool.gauge_reserve_sol,
+    );
+
+    Ok(Json(json!({
+        "cohorts": [top, middle, tail],
+        "total_validators": len,
+        "live": runtime.live_data
+    })))
+}
+
 async fn snapshot_save(
     State(state): State<ApiState>,
     Query(query): Query<LiveQuery>,
@@ -403,6 +583,52 @@ fn filter_strategies(comparison: &mut StrategyComparison, strategy: ApiStrategyF
     });
     comparison.recommended = 0;
     comparison.recommendation_reason = "Filtered to requested strategy type".to_string();
+}
+
+fn find_validator<'a>(
+    validators: &'a [ValidatorGaugeEntry],
+    target: &str,
+) -> Option<&'a ValidatorGaugeEntry> {
+    validators
+        .iter()
+        .find(|v| v.vote_account == target || v.name.eq_ignore_ascii_case(target))
+}
+
+fn classify_threat_level(estimated_cost_usdc: f64) -> &'static str {
+    if estimated_cost_usdc < 10_000.0 {
+        "high"
+    } else if estimated_cost_usdc < 25_000.0 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+fn ranking_neighbors(ranked: &[ValidatorGaugeEntry], idx: usize) -> Value {
+    let above = idx
+        .checked_sub(1)
+        .and_then(|i| ranked.get(i))
+        .map(|v| json!({"vote_account": v.vote_account, "name": v.name, "projected_sol": v.projected_sol}));
+    let below = ranked
+        .get(idx + 1)
+        .map(|v| json!({"vote_account": v.vote_account, "name": v.name, "projected_sol": v.projected_sol}));
+    json!({
+        "above": above,
+        "below": below
+    })
+}
+
+fn cohort_summary(name: &str, cohort: &[ValidatorGaugeEntry], gauge_reserve_sol: f64) -> Value {
+    let vev: f64 = cohort.iter().map(|v| v.vev_weight).sum();
+    let share: f64 = cohort.iter().map(|v| v.vote_share).sum();
+    let projected_sol = gauge_reserve_sol * share;
+    json!({
+        "name": name,
+        "count": cohort.len(),
+        "vev_weight": vev,
+        "vote_share": share,
+        "projected_sol": projected_sol
+    })
 }
 
 #[cfg(test)]

@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use axum::http::Method;
 use clap::Parser;
 use gauge_calculator::{
     api::{router, ApiState},
     config::{default_config_path, AppConfig},
 };
+use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -26,7 +28,7 @@ struct Cli {
     #[arg(long = "host", default_value = "127.0.0.1")]
     host: String,
 
-    #[arg(long = "port", default_value_t = 3000)]
+    #[arg(long = "port", default_value_t = 3001)]
     port: u16,
 }
 
@@ -37,7 +39,11 @@ async fn main() -> Result<()> {
     config.merge_cli_overrides(cli.rpc.clone());
 
     let state = ApiState::new(config, cli.live);
-    let app = router(state);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any);
+    let app = router(state).layer(cors);
 
     let bind = format!("{}:{}", cli.host, cli.port);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
