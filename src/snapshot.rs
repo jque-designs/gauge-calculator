@@ -84,7 +84,7 @@ impl SnapshotStore {
     }
 
     pub fn list(&self, snapshot_kind: Option<&str>, limit: usize) -> Result<Vec<StoredSnapshot>> {
-        let limit = limit.max(1);
+        let limit = limit.max(1) as i64;
         let mut output = Vec::new();
 
         if let Some(kind) = snapshot_kind {
