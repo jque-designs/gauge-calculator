@@ -5,11 +5,12 @@ use gauge_calculator::{
     analysis::{classify_competitors, ConcentrationAnalyzer},
     calculator::{compare_strategies, AcquisitionStrategy, StrategyRequest},
     config::{default_config_path, AppConfig},
-    live::{LiveDataClient, LiveDataSnapshot},
+    live::LiveDataSnapshot,
     output::{
         concentration_csv, render_concentration_table, render_epoch_text, render_status_table,
         render_strategy_table, strategy_csv, to_json, OutputFormat,
     },
+    runtime::build_runtime_context,
     snapshot::{resolve_path as resolve_snapshot_path, SnapshotStore, StoredSnapshot},
     types::{GaugeEligibility, SampleContext},
 };
@@ -141,12 +142,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = AppConfig::load_or_default(&cli.config)?;
     config.merge_cli_overrides(cli.rpc.clone());
-    let mut context = SampleContext::new();
-    let live_data = maybe_fetch_live_data(&cli, &config, &mut context)?;
-    let sol_price_usdc = live_data
-        .as_ref()
-        .and_then(|snapshot| snapshot.sol_price_usdc)
-        .unwrap_or(200.0);
+    let runtime = build_runtime_context(&config, cli.live)?;
+    let context = runtime.context;
+    let live_data = runtime.live_data;
+    let sol_price_usdc = runtime.sol_price_usdc;
 
     if cli.verbose {
         eprintln!("Using RPC: {}", config.rpc.url);
@@ -530,37 +529,6 @@ fn competitor_csv(profiles: &[gauge_calculator::analysis::CompetitorProfile]) ->
         ));
     }
     out
-}
-
-fn maybe_fetch_live_data(
-    cli: &Cli,
-    config: &AppConfig,
-    context: &mut SampleContext,
-) -> Result<Option<LiveDataSnapshot>> {
-    if !cli.live {
-        return Ok(None);
-    }
-
-    let client = LiveDataClient::new()?;
-    let snapshot = client.fetch_all(
-        &config.rpc.url,
-        &config.price.jupiter_api,
-        &config.votex.scrape_url,
-    );
-    apply_live_overlay(context, &snapshot);
-    Ok(Some(snapshot))
-}
-
-fn apply_live_overlay(context: &mut SampleContext, live: &LiveDataSnapshot) {
-    if let Some(vote_accounts) = &live.vote_accounts {
-        let total = vote_accounts.current_count + vote_accounts.delinquent_count;
-        if total > 0 {
-            context.pool.validator_count = total as u32;
-        }
-    }
-    if let Some(epoch) = &live.rpc_epoch {
-        context.gauge.epoch.epoch_number = epoch.epoch.min(u32::MAX as u64) as u32;
-    }
 }
 
 fn live_data_table(live: &LiveDataSnapshot) -> String {
